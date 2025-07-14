@@ -39,6 +39,70 @@ interface Env {
   OPENROUTER_API_KEY?: string;
 }
 
+function convertOpenAIToClaude(openaiResponse: any, originalRequest: any): any {
+  const choices = openaiResponse.choices || [];
+  if (!choices.length) {
+    throw new Error('No choices in OpenAI response');
+  }
+
+  const choice = choices[0];
+  const message = choice.message || {};
+  
+  const contentBlocks = [];
+  
+  if (message.content) {
+    contentBlocks.push({
+      type: 'text',
+      text: message.content
+    });
+  }
+  
+  const toolCalls = message.tool_calls || [];
+  for (const toolCall of toolCalls) {
+    if (toolCall.type === 'function') {
+      let input = {};
+      try {
+        input = JSON.parse(toolCall.function.arguments || '{}');
+      } catch {
+        input = { raw_arguments: toolCall.function.arguments || '' };
+      }
+      
+      contentBlocks.push({
+        type: 'tool_use',
+        id: toolCall.id || `tool_${Math.random().toString(36).slice(2)}`,
+        name: toolCall.function.name || '',
+        input: input
+      });
+    }
+  }
+  
+  if (!contentBlocks.length) {
+    contentBlocks.push({ type: 'text', text: '' });
+  }
+  
+  const finishReason = choice.finish_reason || 'stop';
+  const stopReason = {
+    'stop': 'end_turn',
+    'length': 'max_tokens', 
+    'tool_calls': 'tool_use',
+    'function_call': 'tool_use'
+  }[finishReason] || 'end_turn';
+  
+  return {
+    id: openaiResponse.id || `msg_${Math.random().toString(36).slice(2)}`,
+    type: 'message',
+    role: 'assistant',
+    model: originalRequest.model,
+    content: contentBlocks,
+    stop_reason: stopReason,
+    stop_sequence: null,
+    usage: {
+      input_tokens: openaiResponse.usage?.prompt_tokens || 0,
+      output_tokens: openaiResponse.usage?.completion_tokens || 0
+    }
+  };
+}
+
 async function handleClaudeToOpenRouter(request: Request, env: Env, corsHeaders: Record<string, string>): Promise<Response> {
   if (request.method !== 'POST') {
     return new Response('Method not allowed', { status: 405, headers: corsHeaders });
@@ -113,10 +177,19 @@ async function handleClaudeToOpenRouter(request: Request, env: Env, corsHeaders:
     body: JSON.stringify(openRouterRequest)
   });
 
-  const responseData = await response.text();
+  if (!response.ok) {
+    const errorText = await response.text();
+    return new Response(errorText, {
+      status: response.status,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  }
+
+  const openaiResponse = await response.json();
+  const claudeResponse = convertOpenAIToClaude(openaiResponse, claudeRequest);
   
-  return new Response(responseData, {
-    status: response.status,
+  return new Response(JSON.stringify(claudeResponse), {
+    status: 200,
     headers: {
       ...corsHeaders,
       'Content-Type': 'application/json',
