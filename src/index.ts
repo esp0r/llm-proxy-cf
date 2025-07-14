@@ -119,6 +119,23 @@ function convertOpenAIStreamToClaude(chunk: any, originalRequest: any): any {
       };
     }
     
+    // 处理工具调用流式响应
+    if (delta.tool_calls && delta.tool_calls.length > 0) {
+      const toolCall = delta.tool_calls[0];
+      if (toolCall.function) {
+        return {
+          type: 'content_block_start',
+          index: 1,
+          content_block: {
+            type: 'tool_use',
+            id: toolCall.id || `tool_${Math.random().toString(36).slice(2)}`,
+            name: toolCall.function.name,
+            input: {}
+          }
+        };
+      }
+    }
+    
     if (choice.finish_reason) {
       const stopReason = {
         'stop': 'end_turn',
@@ -169,13 +186,65 @@ async function handleClaudeToOpenRouter(request: Request, env: Env, corsHeaders:
     }
   }
   
+  // 转换Claude工具定义到OpenAI格式
+  function convertClaudeToolsToOpenAI(tools: any[] | undefined) {
+    if (!tools) return undefined;
+    
+    return tools.map(tool => ({
+      type: 'function',
+      function: {
+        name: tool.name,
+        description: tool.description,
+        parameters: tool.input_schema
+      }
+    }));
+  }
+
+  // 转换Claude消息到OpenAI格式
+  function convertClaudeMessagesToOpenAI(messages: any[]) {
+    return messages.map(message => {
+      if (!Array.isArray(message.content)) {
+        return message;
+      }
+      
+      // 处理包含工具结果的消息
+      let content = '';
+      let tool_call_id = '';
+      let isToolResult = false;
+      
+      for (const block of message.content) {
+        if (block.type === 'text') {
+          content += block.text;
+        } else if (block.type === 'tool_result') {
+          isToolResult = true;
+          tool_call_id = block.tool_use_id;
+          content = typeof block.content === 'string' ? block.content : JSON.stringify(block.content);
+        }
+      }
+      
+      if (isToolResult) {
+        return {
+          role: 'tool',
+          tool_call_id: tool_call_id,
+          content: content
+        };
+      }
+      
+      return {
+        ...message,
+        content: content || message.content
+      };
+    });
+  }
+
   const openRouterRequest = {
     model: mapModelName(claudeRequest.model),
-    messages: claudeRequest.messages,
+    messages: convertClaudeMessagesToOpenAI(claudeRequest.messages),
     max_tokens: claudeRequest.max_tokens || 4096,
     temperature: claudeRequest.temperature || 0.7,
     top_p: claudeRequest.top_p,
     stream: claudeRequest.stream || false,
+    tools: convertClaudeToolsToOpenAI(claudeRequest.tools),
   };
 
   Object.keys(openRouterRequest).forEach(key => {
