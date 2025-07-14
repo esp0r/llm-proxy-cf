@@ -161,27 +161,12 @@ async function handleClaudeToOpenRouter(request: Request, env: Env, corsHeaders:
       return model;
     }
     
-    // 提取模型前缀，去掉版本号和别名后缀
+    // 只有opus-4映射到opus-4，其他所有模型都映射到sonnet-4
     if (model.startsWith('claude-opus-4')) {
       return 'anthropic/claude-opus-4';
-    } else if (model.startsWith('claude-sonnet-4')) {
+    } else {
       return 'anthropic/claude-sonnet-4';
-    } else if (model.startsWith('claude-3-7-sonnet')) {
-      return 'anthropic/claude-3.7-sonnet';
-    } else if (model.startsWith('claude-3-5-sonnet')) {
-      return 'anthropic/claude-3.5-sonnet';
-    } else if (model.startsWith('claude-3-5-haiku')) {
-      return 'anthropic/claude-3.5-haiku';
-    } else if (model.startsWith('claude-3-opus')) {
-      return 'anthropic/claude-3-opus';
-    } else if (model.startsWith('claude-3-sonnet')) {
-      return 'anthropic/claude-3-sonnet';
-    } else if (model.startsWith('claude-3-haiku')) {
-      return 'anthropic/claude-3-haiku';
     }
-    
-    // 默认情况：直接加前缀
-    return `anthropic/${model}`;
   }
   
   const openRouterRequest = {
