@@ -103,6 +103,39 @@ function convertOpenAIToClaude(openaiResponse: any, originalRequest: any): any {
   };
 }
 
+function convertOpenAIStreamToClaude(chunk: any, originalRequest: any): any {
+  if (chunk.choices && chunk.choices.length > 0) {
+    const choice = chunk.choices[0];
+    const delta = choice.delta;
+    
+    if (delta.content) {
+      return {
+        type: 'content_block_delta',
+        index: 0,
+        delta: {
+          type: 'text_delta',
+          text: delta.content
+        }
+      };
+    }
+    
+    if (choice.finish_reason) {
+      const stopReason = {
+        'stop': 'end_turn',
+        'length': 'max_tokens',
+        'tool_calls': 'tool_use',
+        'function_call': 'tool_use'
+      }[choice.finish_reason] || 'end_turn';
+      
+      return {
+        type: 'message_stop'
+      };
+    }
+  }
+  
+  return null;
+}
+
 async function handleClaudeToOpenRouter(request: Request, env: Env, corsHeaders: Record<string, string>): Promise<Response> {
   if (request.method !== 'POST') {
     return new Response('Method not allowed', { status: 405, headers: corsHeaders });
@@ -185,6 +218,112 @@ async function handleClaudeToOpenRouter(request: Request, env: Env, corsHeaders:
     });
   }
 
+  if (claudeRequest.stream) {
+    const headers = {
+      ...corsHeaders,
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+    };
+
+    const stream = new ReadableStream({
+      start(controller) {
+        const encoder = new TextEncoder();
+        
+        const sendEvent = (eventType: string, data: any) => {
+          const eventData = `event: ${eventType}\ndata: ${JSON.stringify(data)}\n\n`;
+          controller.enqueue(encoder.encode(eventData));
+        };
+
+        sendEvent('message_start', {
+          type: 'message_start',
+          message: {
+            id: `msg_${Math.random().toString(36).slice(2)}`,
+            type: 'message',
+            role: 'assistant',
+            model: claudeRequest.model,
+            content: [],
+            stop_reason: null,
+            stop_sequence: null,
+            usage: { input_tokens: 0, output_tokens: 0 }
+          }
+        });
+
+        sendEvent('content_block_start', {
+          type: 'content_block_start',
+          index: 0,
+          content_block: {
+            type: 'text',
+            text: ''
+          }
+        });
+
+        const reader = response.body?.getReader();
+        const decoder = new TextDecoder();
+
+        const processStream = async () => {
+          if (!reader) return;
+          
+          try {
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+
+              const chunk = decoder.decode(value);
+              const lines = chunk.split('\n');
+
+              for (const line of lines) {
+                if (line.startsWith('data: ')) {
+                  const data = line.slice(6);
+                  if (data === '[DONE]') {
+                    sendEvent('content_block_stop', { type: 'content_block_stop', index: 0 });
+                    sendEvent('message_delta', { 
+                      type: 'message_delta',
+                      delta: { stop_reason: 'end_turn', stop_sequence: null },
+                      usage: { output_tokens: 0 }
+                    });
+                    sendEvent('message_stop', { type: 'message_stop' });
+                    controller.close();
+                    return;
+                  }
+
+                  try {
+                    const parsed = JSON.parse(data);
+                    const claudeChunk = convertOpenAIStreamToClaude(parsed, claudeRequest);
+                    if (claudeChunk) {
+                      if (claudeChunk.type === 'content_block_delta') {
+                        sendEvent('content_block_delta', claudeChunk);
+                      } else if (claudeChunk.type === 'message_stop') {
+                        sendEvent('content_block_stop', { type: 'content_block_stop', index: 0 });
+                        sendEvent('message_delta', { 
+                          type: 'message_delta',
+                          delta: { stop_reason: 'end_turn', stop_sequence: null },
+                          usage: { output_tokens: 0 }
+                        });
+                        sendEvent('message_stop', claudeChunk);
+                        controller.close();
+                        return;
+                      }
+                    }
+                  } catch (e) {
+                    console.error('Error parsing chunk:', e);
+                  }
+                }
+              }
+            }
+          } catch (error) {
+            console.error('Stream processing error:', error);
+            controller.error(error);
+          }
+        };
+
+        processStream();
+      }
+    });
+
+    return new Response(stream, { status: 200, headers });
+  }
+
   const openaiResponse = await response.json();
   const claudeResponse = convertOpenAIToClaude(openaiResponse, claudeRequest);
   
@@ -210,7 +349,8 @@ async function handleClaudeProxy(request: Request, corsHeaders: Record<string, s
     });
   }
 
-  const claudeRequest = await request.text();
+  const claudeRequestText = await request.text();
+  const claudeRequest = JSON.parse(claudeRequestText);
   
   const response = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
@@ -219,8 +359,63 @@ async function handleClaudeProxy(request: Request, corsHeaders: Record<string, s
       'Content-Type': 'application/json',
       'anthropic-version': '2023-06-01'
     },
-    body: claudeRequest
+    body: claudeRequestText
   });
+
+  if (claudeRequest.stream) {
+    const headers = {
+      ...corsHeaders,
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+    };
+
+    const stream = new ReadableStream({
+      start(controller) {
+        const encoder = new TextEncoder();
+        const reader = response.body?.getReader();
+        const decoder = new TextDecoder();
+
+        const processStream = async () => {
+          if (!reader) return;
+          
+          try {
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+
+              const chunk = decoder.decode(value);
+              const lines = chunk.split('\n');
+
+              for (const line of lines) {
+                if (line.startsWith('data: ')) {
+                  const data = line.slice(6);
+                  
+                  if (data.trim() === '') continue;
+                  
+                  const eventData = `data: ${data}\n\n`;
+                  controller.enqueue(encoder.encode(eventData));
+                }
+                
+                if (line.startsWith('event: ')) {
+                  const eventLine = line + '\n';
+                  controller.enqueue(encoder.encode(eventLine));
+                }
+              }
+            }
+            controller.close();
+          } catch (error) {
+            console.error('Stream processing error:', error);
+            controller.error(error);
+          }
+        };
+
+        processStream();
+      }
+    });
+
+    return new Response(stream, { status: response.status, headers });
+  }
 
   const responseData = await response.text();
   
