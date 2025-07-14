@@ -264,17 +264,21 @@ async function handleClaudeToOpenRouter(request: Request, env: Env, corsHeaders:
         const processStream = async () => {
           if (!reader) return;
           
+          let buffer = '';
+          
           try {
             while (true) {
               const { done, value } = await reader.read();
               if (done) break;
 
-              const chunk = decoder.decode(value);
-              const lines = chunk.split('\n');
+              buffer += decoder.decode(value, { stream: true });
+              const lines = buffer.split('\n');
+              
+              buffer = lines.pop() || '';
 
               for (const line of lines) {
                 if (line.startsWith('data: ')) {
-                  const data = line.slice(6);
+                  const data = line.slice(6).trim();
                   if (data === '[DONE]') {
                     sendEvent('content_block_stop', { type: 'content_block_stop', index: 0 });
                     sendEvent('message_delta', { 
@@ -287,26 +291,28 @@ async function handleClaudeToOpenRouter(request: Request, env: Env, corsHeaders:
                     return;
                   }
 
-                  try {
-                    const parsed = JSON.parse(data);
-                    const claudeChunk = convertOpenAIStreamToClaude(parsed, claudeRequest);
-                    if (claudeChunk) {
-                      if (claudeChunk.type === 'content_block_delta') {
-                        sendEvent('content_block_delta', claudeChunk);
-                      } else if (claudeChunk.type === 'message_stop') {
-                        sendEvent('content_block_stop', { type: 'content_block_stop', index: 0 });
-                        sendEvent('message_delta', { 
-                          type: 'message_delta',
-                          delta: { stop_reason: 'end_turn', stop_sequence: null },
-                          usage: { output_tokens: 0 }
-                        });
-                        sendEvent('message_stop', claudeChunk);
-                        controller.close();
-                        return;
+                  if (data && data !== '') {
+                    try {
+                      const parsed = JSON.parse(data);
+                      const claudeChunk = convertOpenAIStreamToClaude(parsed, claudeRequest);
+                      if (claudeChunk) {
+                        if (claudeChunk.type === 'content_block_delta') {
+                          sendEvent('content_block_delta', claudeChunk);
+                        } else if (claudeChunk.type === 'message_stop') {
+                          sendEvent('content_block_stop', { type: 'content_block_stop', index: 0 });
+                          sendEvent('message_delta', { 
+                            type: 'message_delta',
+                            delta: { stop_reason: 'end_turn', stop_sequence: null },
+                            usage: { output_tokens: 0 }
+                          });
+                          sendEvent('message_stop', claudeChunk);
+                          controller.close();
+                          return;
+                        }
                       }
+                    } catch (e) {
+                      console.error('Error parsing chunk:', e, 'Data:', data);
                     }
-                  } catch (e) {
-                    console.error('Error parsing chunk:', e);
                   }
                 }
               }
