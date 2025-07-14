@@ -58,8 +58,37 @@ async function handleClaudeToOpenRouter(request: Request, env: Env, corsHeaders:
 
   const claudeRequest = await request.json() as any;
   
+  // 转换Claude模型名到OpenRouter格式
+  function mapModelName(model: string): string {
+    if (!model.startsWith('claude-')) {
+      return model;
+    }
+    
+    // 提取模型前缀，去掉版本号和别名后缀
+    if (model.startsWith('claude-opus-4')) {
+      return 'anthropic/claude-opus-4';
+    } else if (model.startsWith('claude-sonnet-4')) {
+      return 'anthropic/claude-sonnet-4';
+    } else if (model.startsWith('claude-3-7-sonnet')) {
+      return 'anthropic/claude-3.7-sonnet';
+    } else if (model.startsWith('claude-3-5-sonnet')) {
+      return 'anthropic/claude-3.5-sonnet';
+    } else if (model.startsWith('claude-3-5-haiku')) {
+      return 'anthropic/claude-3.5-haiku';
+    } else if (model.startsWith('claude-3-opus')) {
+      return 'anthropic/claude-3-opus';
+    } else if (model.startsWith('claude-3-sonnet')) {
+      return 'anthropic/claude-3-sonnet';
+    } else if (model.startsWith('claude-3-haiku')) {
+      return 'anthropic/claude-3-haiku';
+    }
+    
+    // 默认情况：直接加前缀
+    return `anthropic/${model}`;
+  }
+  
   const openRouterRequest = {
-    model: claudeRequest.model.startsWith('claude-') ? `anthropic/${claudeRequest.model}` : claudeRequest.model,
+    model: mapModelName(claudeRequest.model),
     messages: claudeRequest.messages,
     max_tokens: claudeRequest.max_tokens || 4096,
     temperature: claudeRequest.temperature || 0.7,
