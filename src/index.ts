@@ -1,5 +1,49 @@
-export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+// LLM Proxy with new endpoint structure: /from-{source}/to-{target}/{subpath}
+import { AnthropicTransformer, OpenRouterTransformer, BaseTransformer } from './transformers';
+
+interface Env {
+  OPENROUTER_API_KEY?: string;
+  ANTHROPIC_API_KEY?: string;
+}
+
+interface Provider {
+  name: string;
+  baseUrl: string;
+  defaultModel?: string;
+}
+
+class LLMProxyService {
+  private transformers = new Map<string, BaseTransformer>();
+  private providers = new Map<string, Provider>();
+
+  constructor() {
+    this.initializeTransformers();
+    this.initializeProviders();
+  }
+
+  private initializeTransformers() {
+    const anthropic = new AnthropicTransformer();
+    const openrouter = new OpenRouterTransformer();
+    
+    this.transformers.set('anthropic', anthropic);
+    this.transformers.set('openrouter', openrouter);
+  }
+
+  private initializeProviders() {
+    this.providers.set('anthropic', {
+      name: 'anthropic',
+      baseUrl: 'https://api.anthropic.com/v1',
+      defaultModel: 'claude-sonnet-4'
+    });
+    
+    this.providers.set('openrouter', {
+      name: 'openrouter', 
+      baseUrl: 'https://openrouter.ai/api/v1/chat/completions',
+      defaultModel: 'anthropic/claude-sonnet-4'
+    });
+  }
+
+  async handleRequest(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     
     const corsHeaders = {
@@ -13,16 +57,30 @@ export default {
     }
 
     try {
-      if (url.pathname.startsWith('/v1/claude-to-openrouter')) {
-        return await handleClaudeToOpenRouter(request, env, corsHeaders);
-      } else if (url.pathname.startsWith('/v1/claude-proxy')) {
-        return await handleClaudeProxy(request, corsHeaders);
-      } else {
-        return new Response('LLM Proxy Service\n\nEndpoints:\n- POST /v1/claude-to-openrouter/messages (使用 Claude API 格式和 Authorization header)\n- POST /v1/claude-proxy/messages (直接代理 Claude API)', {
-          status: 200,
-          headers: { ...corsHeaders, 'Content-Type': 'text/plain' }
-        });
+      // Parse new endpoint pattern: /from-{source}/to-{target}/{subpath}
+      const pathMatch = url.pathname.match(/^\/from-(\w+)\/to-(\w+)(?:\/(.*))?$/);
+      
+      if (pathMatch) {
+        const [, sourceProvider, targetProvider, subPath] = pathMatch;
+        return await this.handleConversionRequest(
+          request, 
+          env, 
+          corsHeaders, 
+          sourceProvider, 
+          targetProvider, 
+          subPath || 'messages'
+        );
       }
+
+      // Handle /v1/chat/completions as a subpath in conversion endpoints
+      // This allows URLs like /from-anthropic/to-openrouter/v1/chat/completions
+
+      // Root endpoint - show API documentation
+      return new Response(this.getApiDocumentation(), {
+        status: 200,
+        headers: { ...corsHeaders, 'Content-Type': 'text/plain' }
+      });
+
     } catch (error) {
       console.error('Error:', error);
       return new Response(JSON.stringify({ 
@@ -32,458 +90,273 @@ export default {
         headers: { ...corsHeaders, 'Content-Type': 'application/json' }
       });
     }
-  },
-};
-
-interface Env {
-  OPENROUTER_API_KEY?: string;
-}
-
-function convertOpenAIToClaude(openaiResponse: any, originalRequest: any): any {
-  const choices = openaiResponse.choices || [];
-  if (!choices.length) {
-    throw new Error('No choices in OpenAI response');
   }
 
-  const choice = choices[0];
-  const message = choice.message || {};
-  
-  const contentBlocks = [];
-  
-  if (message.content) {
-    contentBlocks.push({
-      type: 'text',
-      text: message.content
-    });
-  }
-  
-  const toolCalls = message.tool_calls || [];
-  for (const toolCall of toolCalls) {
-    if (toolCall.type === 'function') {
-      let input = {};
-      try {
-        input = JSON.parse(toolCall.function.arguments || '{}');
-      } catch {
-        input = { raw_arguments: toolCall.function.arguments || '' };
-      }
+  private async handleConversionRequest(
+    request: Request, 
+    env: Env, 
+    corsHeaders: Record<string, string>,
+    sourceProvider: string,
+    targetProvider: string,
+    subPath: string
+  ): Promise<Response> {
+    if (request.method !== 'POST') {
+      return new Response('Method not allowed', { status: 405, headers: corsHeaders });
+    }
+
+    // Validate providers
+    const sourceTransformer = this.transformers.get(sourceProvider);
+    const targetTransformer = this.transformers.get(targetProvider);
+    const targetProviderConfig = this.providers.get(targetProvider);
+
+    if (!sourceTransformer || !targetTransformer || !targetProviderConfig) {
+      return new Response(JSON.stringify({ 
+        error: `Invalid provider combination: ${sourceProvider} -> ${targetProvider}` 
+      }), {
+        status: 400,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+
+    try {
+      const requestBody = await request.json();
       
-      contentBlocks.push({
-        type: 'tool_use',
-        id: toolCall.id || `tool_${Math.random().toString(36).slice(2)}`,
-        name: toolCall.function.name || '',
-        input: input
+      // Get API key
+      const authHeader = request.headers.get('Authorization');
+      const apiKey = authHeader?.replace('Bearer ', '') || this.getApiKey(targetProvider, env);
+      
+      if (!apiKey) {
+        return new Response(JSON.stringify({ 
+          error: `Missing API key for ${targetProvider}` 
+        }), {
+          status: 401,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+      }
+
+      // Handle streaming
+      if (requestBody.stream) {
+        return await this.handleStreamingRequest(
+          requestBody,
+          sourceTransformer,
+          targetTransformer,
+          targetProviderConfig,
+          apiKey,
+          subPath,
+          corsHeaders
+        );
+      }
+
+      // Non-streaming handling
+      let transformedRequest;
+      
+      if (sourceProvider === targetProvider) {
+        // Same provider - pass through
+        transformedRequest = requestBody;
+      } else {
+        // Cross-provider transformation
+        const unifiedRequest = await sourceTransformer.transformRequestOut(requestBody);
+        transformedRequest = await targetTransformer.transformRequestIn(unifiedRequest);
+      }
+
+      // Make request to target provider
+      const response = await this.makeProviderRequest(
+        targetProviderConfig, 
+        transformedRequest, 
+        apiKey,
+        subPath
+      );
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        return new Response(errorText, {
+          status: response.status,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+      }
+
+      const responseData = await response.json();
+
+      // Transform response if needed
+      if (sourceProvider !== targetProvider) {
+        const unifiedResponse = await targetTransformer.transformResponseOut(responseData);
+        const finalResponse = await sourceTransformer.transformResponseIn(unifiedResponse);
+        
+        return new Response(JSON.stringify(finalResponse), {
+          status: 200,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+      } else {
+        return new Response(JSON.stringify(responseData), {
+          status: 200,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+      }
+
+    } catch (error) {
+      console.error(`Conversion error (${sourceProvider}->${targetProvider}):`, error);
+      return new Response(JSON.stringify({ 
+        error: error instanceof Error ? error.message : 'Conversion failed' 
+      }), {
+        status: 500,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
       });
     }
   }
-  
-  if (!contentBlocks.length) {
-    contentBlocks.push({ type: 'text', text: '' });
-  }
-  
-  const finishReason = choice.finish_reason || 'stop';
-  const stopReason = {
-    'stop': 'end_turn',
-    'length': 'max_tokens', 
-    'tool_calls': 'tool_use',
-    'function_call': 'tool_use'
-  }[finishReason] || 'end_turn';
-  
-  return {
-    id: openaiResponse.id || `msg_${Math.random().toString(36).slice(2)}`,
-    type: 'message',
-    role: 'assistant',
-    model: originalRequest.model,
-    content: contentBlocks,
-    stop_reason: stopReason,
-    stop_sequence: null,
-    usage: {
-      input_tokens: openaiResponse.usage?.prompt_tokens || 0,
-      output_tokens: openaiResponse.usage?.completion_tokens || 0
-    }
-  };
-}
 
-function convertOpenAIStreamToClaude(chunk: any, originalRequest: any): any {
-  if (chunk.choices && chunk.choices.length > 0) {
-    const choice = chunk.choices[0];
-    const delta = choice.delta;
-    
-    if (delta.content) {
-      return {
-        type: 'content_block_delta',
-        index: 0,
-        delta: {
-          type: 'text_delta',
-          text: delta.content
-        }
-      };
-    }
-    
-    // 处理工具调用流式响应
-    if (delta.tool_calls && delta.tool_calls.length > 0) {
-      const toolCall = delta.tool_calls[0];
-      if (toolCall.function) {
-        return {
-          type: 'content_block_start',
-          index: 1,
-          content_block: {
-            type: 'tool_use',
-            id: toolCall.id || `tool_${Math.random().toString(36).slice(2)}`,
-            name: toolCall.function.name,
-            input: {}
-          }
-        };
-      }
-    }
-    
-    if (choice.finish_reason) {
-      const stopReason = {
-        'stop': 'end_turn',
-        'length': 'max_tokens',
-        'tool_calls': 'tool_use',
-        'function_call': 'tool_use'
-      }[choice.finish_reason] || 'end_turn';
-      
-      return {
-        type: 'message_stop'
-      };
-    }
-  }
-  
-  return null;
-}
-
-async function handleClaudeToOpenRouter(request: Request, env: Env, corsHeaders: Record<string, string>): Promise<Response> {
-  if (request.method !== 'POST') {
-    return new Response('Method not allowed', { status: 405, headers: corsHeaders });
-  }
-
-  const authHeader = request.headers.get('Authorization');
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return new Response(JSON.stringify({ error: '需要有效的 Authorization header' }), {
-      status: 401,
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-    });
-  }
-
-  // 从 Authorization header 中提取 OpenRouter API Key
-  // 格式: "Bearer sk-or-v1-your-openrouter-key"
-  const openRouterKey = authHeader.replace('Bearer ', '');
-
-  const claudeRequest = await request.json() as any;
-  
-  // 转换Claude模型名到OpenRouter格式
-  function mapModelName(model: string): string {
-    if (!model.startsWith('claude-')) {
-      return model;
-    }
-    
-    // 只有opus-4映射到opus-4，其他所有模型都映射到sonnet-4
-    if (model.startsWith('claude-opus-4')) {
-      return 'anthropic/claude-opus-4';
+  private async handleStreamingRequest(
+    requestBody: any,
+    sourceTransformer: BaseTransformer,
+    targetTransformer: BaseTransformer,
+    targetProvider: Provider,
+    apiKey: string,
+    subPath: string,
+    corsHeaders: Record<string, string>
+  ): Promise<Response> {
+    // Transform request if needed
+    let transformedRequest;
+    if (sourceTransformer.name === targetTransformer.name) {
+      transformedRequest = requestBody;
     } else {
-      return 'anthropic/claude-sonnet-4';
+      const unifiedRequest = await sourceTransformer.transformRequestOut(requestBody);
+      transformedRequest = await targetTransformer.transformRequestIn(unifiedRequest);
     }
-  }
-  
-  // 转换Claude工具定义到OpenAI格式
-  function convertClaudeToolsToOpenAI(tools: any[] | undefined) {
-    if (!tools) return undefined;
-    
-    return tools.map(tool => ({
-      type: 'function',
-      function: {
-        name: tool.name,
-        description: tool.description,
-        parameters: tool.input_schema
-      }
-    }));
-  }
 
-  // 转换Claude消息到OpenAI格式
-  function convertClaudeMessagesToOpenAI(messages: any[]) {
-    return messages.map(message => {
-      if (!Array.isArray(message.content)) {
-        return message;
-      }
-      
-      // 处理包含工具结果的消息
-      let content = '';
-      let tool_call_id = '';
-      let isToolResult = false;
-      
-      for (const block of message.content) {
-        if (block.type === 'text') {
-          content += block.text;
-        } else if (block.type === 'tool_result') {
-          isToolResult = true;
-          tool_call_id = block.tool_use_id;
-          content = typeof block.content === 'string' ? block.content : JSON.stringify(block.content);
-        }
-      }
-      
-      if (isToolResult) {
-        return {
-          role: 'tool',
-          tool_call_id: tool_call_id,
-          content: content
-        };
-      }
-      
-      return {
-        ...message,
-        content: content || message.content
+    const response = await this.makeProviderRequest(
+      targetProvider,
+      transformedRequest,
+      apiKey,
+      subPath
+    );
+
+    // For streaming, if no transformation needed, pass through
+    if (sourceTransformer.name === targetTransformer.name) {
+      const headers = {
+        ...corsHeaders,
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
       };
-    });
-  }
-
-  const openRouterRequest = {
-    model: mapModelName(claudeRequest.model),
-    messages: convertClaudeMessagesToOpenAI(claudeRequest.messages),
-    max_tokens: claudeRequest.max_tokens || 4096,
-    temperature: claudeRequest.temperature || 0.7,
-    top_p: claudeRequest.top_p,
-    stream: claudeRequest.stream || false,
-    tools: convertClaudeToolsToOpenAI(claudeRequest.tools),
-  };
-
-  Object.keys(openRouterRequest).forEach(key => {
-    if (openRouterRequest[key as keyof typeof openRouterRequest] === undefined) {
-      delete openRouterRequest[key as keyof typeof openRouterRequest];
+      return new Response(response.body, { status: response.status, headers });
     }
-  });
 
-  const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${openRouterKey}`,
-      'Content-Type': 'application/json',
-      'HTTP-Referer': request.headers.get('referer') || 'https://your-domain.com',
-      'X-Title': 'LLM Proxy Service'
-    },
-    body: JSON.stringify(openRouterRequest)
-  });
+    // For cross-provider streaming, we need to transform the stream
+    // For now, disable streaming and use non-streaming response
+    if (!response.ok) {
+      const errorText = await response.text();
+      return new Response(errorText, {
+        status: response.status,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
 
-  if (!response.ok) {
-    const errorText = await response.text();
-    return new Response(errorText, {
-      status: response.status,
+    // Convert to non-streaming response for proper transformation
+    const responseData = await response.json();
+    const unifiedResponse = await targetTransformer.transformResponseOut(responseData);
+    const finalResponse = await sourceTransformer.transformResponseIn(unifiedResponse);
+    
+    return new Response(JSON.stringify(finalResponse), {
+      status: 200,
       headers: { ...corsHeaders, 'Content-Type': 'application/json' }
     });
   }
 
-  if (claudeRequest.stream) {
-    const headers = {
-      ...corsHeaders,
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
-      'Connection': 'keep-alive',
+  private async makeProviderRequest(
+    provider: Provider,
+    requestData: any,
+    apiKey: string,
+    subPath: string
+  ): Promise<Response> {
+    let endpoint: string;
+    
+    if (provider.name === 'anthropic') {
+      // Anthropic API: always use /messages endpoint
+      endpoint = `${provider.baseUrl}/messages`;
+    } else if (provider.name === 'openrouter') {
+      // OpenRouter API: baseUrl already includes /v1/chat/completions
+      endpoint = provider.baseUrl;
+    } else {
+      // Generic provider: append subPath
+      endpoint = subPath === 'messages' ? provider.baseUrl : `${provider.baseUrl}/${subPath}`;
+    }
+    
+    const headers: Record<string, string> = {
+      'Authorization': `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
     };
 
-    const stream = new ReadableStream({
-      start(controller) {
-        const encoder = new TextEncoder();
-        
-        const sendEvent = (eventType: string, data: any) => {
-          const eventData = `event: ${eventType}\ndata: ${JSON.stringify(data)}\n\n`;
-          controller.enqueue(encoder.encode(eventData));
-        };
+    // Add provider-specific headers
+    if (provider.name === 'anthropic') {
+      headers['anthropic-version'] = '2023-06-01';
+    } else if (provider.name === 'openrouter') {
+      headers['HTTP-Referer'] = 'https://llm-proxy.workers.dev';
+      headers['X-Title'] = 'LLM Proxy Service';
+    }
 
-        sendEvent('message_start', {
-          type: 'message_start',
-          message: {
-            id: `msg_${Math.random().toString(36).slice(2)}`,
-            type: 'message',
-            role: 'assistant',
-            model: claudeRequest.model,
-            content: [],
-            stop_reason: null,
-            stop_sequence: null,
-            usage: { input_tokens: 0, output_tokens: 0 }
-          }
-        });
-
-        sendEvent('content_block_start', {
-          type: 'content_block_start',
-          index: 0,
-          content_block: {
-            type: 'text',
-            text: ''
-          }
-        });
-
-        const reader = response.body?.getReader();
-        const decoder = new TextDecoder();
-
-        const processStream = async () => {
-          if (!reader) return;
-          
-          let buffer = '';
-          
-          try {
-            while (true) {
-              const { done, value } = await reader.read();
-              if (done) break;
-
-              buffer += decoder.decode(value, { stream: true });
-              const lines = buffer.split('\n');
-              
-              buffer = lines.pop() || '';
-
-              for (const line of lines) {
-                if (line.startsWith('data: ')) {
-                  const data = line.slice(6).trim();
-                  if (data === '[DONE]') {
-                    sendEvent('content_block_stop', { type: 'content_block_stop', index: 0 });
-                    sendEvent('message_delta', { 
-                      type: 'message_delta',
-                      delta: { stop_reason: 'end_turn', stop_sequence: null },
-                      usage: { output_tokens: 0 }
-                    });
-                    sendEvent('message_stop', { type: 'message_stop' });
-                    controller.close();
-                    return;
-                  }
-
-                  if (data && data !== '') {
-                    try {
-                      const parsed = JSON.parse(data);
-                      const claudeChunk = convertOpenAIStreamToClaude(parsed, claudeRequest);
-                      if (claudeChunk) {
-                        if (claudeChunk.type === 'content_block_delta') {
-                          sendEvent('content_block_delta', claudeChunk);
-                        } else if (claudeChunk.type === 'message_stop') {
-                          sendEvent('content_block_stop', { type: 'content_block_stop', index: 0 });
-                          sendEvent('message_delta', { 
-                            type: 'message_delta',
-                            delta: { stop_reason: 'end_turn', stop_sequence: null },
-                            usage: { output_tokens: 0 }
-                          });
-                          sendEvent('message_stop', claudeChunk);
-                          controller.close();
-                          return;
-                        }
-                      }
-                    } catch (e) {
-                      console.error('Error parsing chunk:', e, 'Data:', data);
-                    }
-                  }
-                }
-              }
-            }
-          } catch (error) {
-            console.error('Stream processing error:', error);
-            controller.error(error);
-          }
-        };
-
-        processStream();
-      }
+    return await fetch(endpoint, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(requestData)
     });
-
-    return new Response(stream, { status: 200, headers });
   }
 
-  const openaiResponse = await response.json();
-  const claudeResponse = convertOpenAIToClaude(openaiResponse, claudeRequest);
-  
-  return new Response(JSON.stringify(claudeResponse), {
-    status: 200,
-    headers: {
-      ...corsHeaders,
-      'Content-Type': 'application/json',
+  private getApiKey(providerName: string, env: Env): string {
+    switch (providerName) {
+      case 'openrouter':
+        return env.OPENROUTER_API_KEY || '';
+      case 'anthropic':
+        return env.ANTHROPIC_API_KEY || '';
+      default:
+        return '';
     }
-  });
+  }
+
+  private getApiDocumentation(): string {
+    return `LLM Proxy Service
+
+Endpoint Pattern:
+POST /from-{source}/to-{target}/{subpath}
+
+Examples:
+• POST /from-anthropic/to-openrouter/messages
+  Convert Anthropic format to OpenRouter format
+  
+• POST /from-openrouter/to-anthropic/messages  
+  Convert OpenRouter format to Anthropic format
+  
+• POST /from-anthropic/to-anthropic/messages
+  Direct Anthropic API proxy
+
+Supported Providers:
+• anthropic: Direct Anthropic API  
+• openrouter: OpenRouter proxy service
+
+Authentication:
+Use Authorization: Bearer <api-key> header
+Or set environment variables: OPENROUTER_API_KEY, ANTHROPIC_API_KEY
+
+Features:
+• Automatic request/response format conversion
+• Streaming support
+• Tool calling support
+• CORS enabled
+
+Example:
+curl -X POST https://your-worker.workers.dev/from-anthropic/to-openrouter/messages \\
+  -H "Authorization: Bearer your-openrouter-key" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "model": "claude-sonnet-4",
+    "messages": [{"role": "user", "content": "Hello"}],
+    "max_tokens": 1000
+  }'`;
+  }
 }
 
-async function handleClaudeProxy(request: Request, corsHeaders: Record<string, string>): Promise<Response> {
-  if (request.method !== 'POST') {
-    return new Response('Method not allowed', { status: 405, headers: corsHeaders });
-  }
+const proxyService = new LLMProxyService();
 
-  const authHeader = request.headers.get('Authorization');
-  if (!authHeader) {
-    return new Response(JSON.stringify({ error: '需要 Authorization header' }), {
-      status: 401,
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-    });
-  }
-
-  const claudeRequestText = await request.text();
-  const claudeRequest = JSON.parse(claudeRequestText);
-  
-  const response = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'Authorization': authHeader,
-      'Content-Type': 'application/json',
-      'anthropic-version': '2023-06-01'
-    },
-    body: claudeRequestText
-  });
-
-  if (claudeRequest.stream) {
-    const headers = {
-      ...corsHeaders,
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
-      'Connection': 'keep-alive',
-    };
-
-    const stream = new ReadableStream({
-      start(controller) {
-        const encoder = new TextEncoder();
-        const reader = response.body?.getReader();
-        const decoder = new TextDecoder();
-
-        const processStream = async () => {
-          if (!reader) return;
-          
-          try {
-            while (true) {
-              const { done, value } = await reader.read();
-              if (done) break;
-
-              const chunk = decoder.decode(value);
-              const lines = chunk.split('\n');
-
-              for (const line of lines) {
-                if (line.startsWith('data: ')) {
-                  const data = line.slice(6);
-                  
-                  if (data.trim() === '') continue;
-                  
-                  const eventData = `data: ${data}\n\n`;
-                  controller.enqueue(encoder.encode(eventData));
-                }
-                
-                if (line.startsWith('event: ')) {
-                  const eventLine = line + '\n';
-                  controller.enqueue(encoder.encode(eventLine));
-                }
-              }
-            }
-            controller.close();
-          } catch (error) {
-            console.error('Stream processing error:', error);
-            controller.error(error);
-          }
-        };
-
-        processStream();
-      }
-    });
-
-    return new Response(stream, { status: response.status, headers });
-  }
-
-  const responseData = await response.text();
-  
-  return new Response(responseData, {
-    status: response.status,
-    headers: {
-      ...corsHeaders,
-      'Content-Type': 'application/json',
-    }
-  });
-}
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    return proxyService.handleRequest(request, env);
+  },
+};

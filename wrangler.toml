@@ -1,6 +1,17 @@
-name = "llm-proxy"
+name = "llm-proxy-cf"
 main = "src/index.ts"
-compatibility_date = "2024-01-01"
+compatibility_date = "2024-05-15"
 
 [observability]
 enabled = true
+
+[env.production]
+name = "llm-proxy-cf"
+vars = { ENVIRONMENT = "production" }
+
+[env.development]  
+name = "llm-proxy-cf-dev"
+vars = { ENVIRONMENT = "development" }
+
+[vars]
+ENVIRONMENT = "development"

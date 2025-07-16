@@ -1,61 +1,161 @@
-# LLM API Proxy Service
-Cloudflare Workers服务，提供LLM API代理和格式自动转换。
+# LLM Proxy for Cloudflare Workers
 
+A simple and elegant LLM API proxy service that enables seamless format conversion between different LLM providers through a clean endpoint-based architecture.
 
-## 端点说明
+## Features
 
-### 1. Claude转OpenRouter (`/v1/claude-to-openrouter/messages`)
-- 接收标准Claude API格式请求
-- 自动转换模型名称（如：`claude-3-sonnet` → `anthropic/claude-3-sonnet`）
-- 使用OpenRouter API Key（通过Authorization header传递）
+- 🔄 **Format Conversion**: Automatic request/response conversion between providers
+- 🔌 **Endpoint-based**: Clean `/from-{source}/to-{target}` URL structure  
+- 🚀 **Cloudflare Workers**: Fast global deployment
+- 📡 **Streaming Support**: Real-time response streaming
+- 🛠️ **Tool Calling**: Full function calling support
+- 🌐 **CORS Enabled**: Ready for web applications
 
-### 2. Claude直接代理 (`/v1/claude-proxy/messages`)
-- 直接转发请求到Claude API
-- 使用Claude API Key（通过Authorization header传递）
+## Supported Providers
 
-## 快速部署
+- **anthropic**: Direct Anthropic API
+- **openrouter**: OpenRouter proxy service
 
-### 1. 安装Wrangler CLI
+## API Endpoints
+
+### Format: `POST /from-{source}/to-{target}/{subpath}`
+
+### Examples
+
+**Convert Anthropic to OpenRouter format:**
 ```bash
-npm install -g wrangler
-```
-
-### 2. 登录Cloudflare
-```bash
-wrangler login
-```
-
-### 3. 一键部署
-```bash
-wrangler deploy
-```
-
-## 使用示例
-
-### Claude转OpenRouter
-使用OpenRouter API Key，但发送Claude格式请求：
-
-```bash
-curl -X POST https://llm-proxy.YOUR_NAME.workers.dev/v1/claude-to-openrouter/messages \
+curl -X POST https://your-worker.workers.dev/from-anthropic/to-openrouter/messages \
+  -H "Authorization: Bearer your-openrouter-key" \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer sk-or-v1-your-openrouter-key" \
   -d '{
     "model": "claude-sonnet-4",
-    "max_tokens": 1024,
-    "messages": [{"role": "user", "content": "Hello"}]
+    "messages": [{"role": "user", "content": "Hello"}],
+    "max_tokens": 1000
   }'
 ```
 
-### Claude直接代理
-使用Claude API Key：
+**Direct Anthropic proxy:**
+```bash
+curl -X POST https://your-worker.workers.dev/from-anthropic/to-anthropic/messages \
+  -H "Authorization: Bearer your-anthropic-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-sonnet-4",
+    "messages": [{"role": "user", "content": "Hello"}],
+    "max_tokens": 1000
+  }'
+```
+
+**Convert OpenRouter to Anthropic format:**
+```bash
+curl -X POST https://your-worker.workers.dev/from-openrouter/to-anthropic/messages \
+  -H "Authorization: Bearer your-anthropic-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "anthropic/claude-sonnet-4",
+    "messages": [{"role": "user", "content": "Hello"}],
+    "max_tokens": 1000
+  }'
+```
+
+## Authentication
+
+### Option 1: Authorization Header
+```bash
+-H "Authorization: Bearer your-api-key"
+```
+
+### Option 2: Environment Variables
+Set these in your Cloudflare Workers environment:
+- `OPENROUTER_API_KEY`
+- `ANTHROPIC_API_KEY`
+
+## Deployment
+
+### Prerequisites
+- Node.js 18+
+- Cloudflare account
+- Wrangler CLI
+
+### Setup
+
+1. **Clone and install:**
+   ```bash
+   git clone <repository>
+   cd llm-proxy-cf
+   npm install
+   ```
+
+2. **Configure Wrangler:**
+   ```bash
+   wrangler login
+   ```
+
+3. **Set up environment variables:**
+   ```bash
+   wrangler secret put OPENROUTER_API_KEY
+   wrangler secret put ANTHROPIC_API_KEY
+   ```
+
+4. **Deploy:**
+   ```bash
+   npm run deploy
+   ```
+
+### Development
 
 ```bash
-curl -X POST https://llm-proxy.YOUR_NAME.workers.dev/v1/claude-proxy/messages \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer sk-ant-your-claude-key" \
-  -d '{
-    "model": "claude-sonnet-4", 
-    "max_tokens": 1024,
-    "messages": [{"role": "user", "content": "Hello"}]
-  }'
+npm run dev
 ```
+
+Access at: http://localhost:8787
+
+## Architecture
+
+```
+Client Request
+     ↓
+[Source Transformer] → [Unified Format] → [Target Transformer]
+     ↓                                            ↓
+[Target API]                              [Response Transform]
+     ↓                                            ↓
+[Target Transformer] ← [Unified Format] ← [Source Transformer]
+     ↓
+Client Response
+```
+
+## Project Structure
+
+```
+src/
+├── index.ts         # Main worker entry point
+└── transformers.ts  # Format conversion logic
+```
+
+## Configuration
+
+### wrangler.toml
+```toml
+name = "llm-proxy-cf"
+main = "src/index.ts"
+compatibility_date = "2024-05-15"
+
+[observability]
+enabled = true
+```
+
+## License
+
+MIT License - see LICENSE file for details.
+
+## Contributing
+
+1. Fork the repository
+2. Create a feature branch
+3. Make your changes
+4. Test thoroughly
+5. Submit a pull request
+
+---
+
+**Simple. Fast. Reliable.** ⚡

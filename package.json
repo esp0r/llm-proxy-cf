@@ -1,0 +1,28 @@
+{
+  "name": "llm-proxy-cf",
+  "version": "1.0.0",
+  "description": "Simple LLM Proxy for Cloudflare Workers with endpoint-based format conversion",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "build": "tsc --noEmit"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20241218.0",
+    "typescript": "^5.8.3",
+    "wrangler": "^3.100.0"
+  },
+  "keywords": [
+    "llm",
+    "proxy",
+    "cloudflare",
+    "workers",
+    "anthropic",
+    "openrouter",
+    "format-conversion"
+  ],
+  "author": "yutian",
+  "license": "MIT"
+}
